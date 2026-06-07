@@ -25,14 +25,17 @@ class NavigationActionServer(Node):
     def goal_callback(self, goal_request):
         self.get_logger().info("Received goal request")
         requested_mode = goal_request.mode
-        if requested_mode == "Manual_Nav":
-            car_position, _ = self.car_control_node.get_car_position_and_orientation()
-            path_points = self.car_control_node.get_path_points(
-                include_orientation=True
-            )
-            if not car_position or not path_points:
-                self.get_logger().error("Cannot start navigation: Missing data")
-                return GoalResponse.REJECT
+        
+        # 【修正】：移除 if requested_mode == "Manual_Nav": 的限制
+        # 確保無論哪個模式，都必須等到 Nav2 畫出藍色路線才能啟動
+        car_position, _ = self.car_control_node.get_car_position_and_orientation()
+        path_points = self.car_control_node.get_path_points(
+            include_orientation=True
+        )
+        if not car_position or not path_points:
+            self.get_logger().error(f"Cannot start navigation ({requested_mode}): Missing data (請等藍色路線出現後再啟動！)")
+            return GoalResponse.REJECT
+            
         return GoalResponse.ACCEPT
 
     def cancel_callback(self, goal_handle):
