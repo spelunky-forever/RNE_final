@@ -61,20 +61,32 @@ class NavigationController:
             # self.car_control_node.publish_control("STOP")                
         else:
             self.nav_end_flag = 0
-            y_offset = coordinate["ball"][1]
-            object_depth = coordinate["ball"][0]
-            if object_depth < 0.3:
-                for i in range(10):
-                    self.car_control_node.publish_control("STOP")
-                    time.sleep(0.1)
-                self.car_control_node.clear_plan()
-                self.car_control_node.clear_goal_pose()
-                return NavGoal.Result(
-                    success=True,
-                    message="Navigation goal reached successfully. Final distance",
-                )
-            action = self.choose_action_y_offset(y_offset,object_depth)
-            self.car_control_node.publish_control(action)
+            # --- [開始修改] 替換原有的 "ball" 為新模型的 "bear" ---
+            # 未來如果 Task 2 需要追蹤橋樑，也可以在此加入 elif "bridge" in coordinate: 的邏輯
+            if "bear" in coordinate:
+                y_offset = coordinate["bear"][1]
+                object_depth = coordinate["bear"][0]
+                
+                # 若距離小於 0.3，視為到達可夾取位置
+                if object_depth < 0.3:
+                    for i in range(10):
+                        self.car_control_node.publish_control("STOP")
+                        time.sleep(0.1)
+                    self.car_control_node.clear_plan()
+                    self.car_control_node.clear_goal_pose()
+                    return NavGoal.Result(
+                        success=True,
+                        message="Navigation goal reached successfully. Final distance",
+                    )
+                
+                # 否則根據 y_offset 調整車體轉向
+                action = self.choose_action_y_offset(y_offset, object_depth)
+                self.car_control_node.publish_control(action)
+            else:
+                # 畫面中有其他 YOLO 目標（如 road/bridge），但沒有 bear 時的預設行為
+                # 目前先讓它使用 manual_nav 繼續導航，或你可以自訂針對橋樑的導航
+                self.signal = self.manual_nav()
+            # --- [修改結束] ---
             
         # print(self.car_control_node.get_latest_object_coordinates())
     def choose_action_y_offset(self, y_offset, object_depth):

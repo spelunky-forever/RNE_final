@@ -77,7 +77,7 @@ class ArmAutoController:
         # self.arm_agnle_control.arm_all_change([])
 
     def catch(self, should_cancel=lambda: False):
-        label = "tennis"
+        label = "bear"
         while self.depth > 0.4:
             print(self.depth)
             try:
@@ -227,7 +227,7 @@ class ArmAutoController:
         while 1:
             if should_cancel():
                 return ArmGoal.Result(success=False, message="Canceled by user")
-            self.follow_obj(label="tennis", step=5)
+            self.follow_obj(label="bear", step=5)
 
     def radians_to_degrees(self, radians_list):
         """Converts a list of angles from radians to degrees."""
@@ -287,7 +287,7 @@ class ArmAutoController:
             and abs(z) <= 0.1
         )
 
-    def follow_obj(self, label="ball", target_depth=0.3, step=10):
+    def follow_obj(self, label="bear", target_depth=0.3, step=10):
         # 參數設定
         depth_threshold = 0.05
         lateral_threshold = 0.05
@@ -358,7 +358,7 @@ class ArmAutoController:
         # This must use imu data
         imu_data = self.arm_commute_node.get_latest_imu_data()
         obj_position_data = self.arm_commute_node.get_latest_object_coordinates(
-            label="fire"
+            label="bear"
         )
         extrinsics = self.pybullet_robot_controller.calculate_imu_extrinsics(
             imu_world_quaternion=imu_data, link_name="camera_1", visualize=False
