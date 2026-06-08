@@ -9,95 +9,159 @@ class NavigationController:
     def __init__(self, car_control_node):
         self.car_control_node = car_control_node
         self.nav_end_flag = 0 
-        # 【新增】：定義自駕核心有限狀態機狀態 (FSM)
-        self.STATE_NAV2_TRACKING = "NAV2_TRACKING"       # 狀態 1：跟隨 Nav2 全域路徑大範圍行駛
-        self.STATE_VISUAL_SERVO_BEAR = "VISUAL_SERVO"   # 狀態 2：發現熊目標，視覺伺服精密對齊
-        self.STATE_CROSS_BRIDGE = "CROSS_BRIDGE"         # 狀態 3：發現橋樑，無視 Nav2 視覺強行衝刺過橋
-        self.STATE_ARRIVED_STOPPING = "ARRIVED_STOPPING" # 狀態 4：到達目標精準煞車距離
-        self.current_state = self.STATE_NAV2_TRACKING   # 預設為 Nav2 導航模式
+        self.STATE_NAV2_TRACKING = "NAV2_TRACKING"       
+        self.STATE_VISUAL_SERVO_BEAR = "VISUAL_SERVO"   
+        self.STATE_CROSS_BRIDGE = "CROSS_BRIDGE"         
+        self.STATE_ARRIVED_STOPPING = "ARRIVED_STOPPING" 
+        self.current_state = self.STATE_NAV2_TRACKING   
 
-    def check_prerequisites(self):
-        """Check if all prerequisites for navigation are met"""
-        # Check if we have position data
-        car_position, car_orientation = (
-            self.car_control_node.get_car_position_and_orientation()
-        )
-        path_points = self.car_control_node.get_path_points()
-        goal_pose = self.car_control_node.get_goal_pose()
+    # ==========================================
+    # 核心新增 1：差速驅動底層轉換 (Kinematic Model)
+    # ==========================================
+    def cmd_vel_to_wheels(self, v, w):
+        """
+        將線速度 (v) 與角速度 (w) 轉換為四輪轉速並放大至 Unity 適用區間
+        """
+        # ==========================================
+        # 【核心修正】物理單位與 Unity 數值縮放
+        # ==========================================
+        v_scale = 18.0  # 【調參點】放大前進速度，讓它接近 manual 的 10.0
+        w_scale = 15.0  # 【調參點】放大轉向速度，讓車子有足夠力矩轉向不撞牆
+        
+        v_unity = v * v_scale
+        w_unity = w * w_scale
 
-        # Check data validity
-        if not car_position or not path_points or not goal_pose:
-            # Determine the specific error message based on what's missing
-            message = (
-                "Cannot obtain car position data"
-                if not car_position
-                else (
-                    "No path points available for navigation"
-                    if not path_points
-                    else "No goal pose defined for navigation"
-                )
-            )
+        track_factor = 1.2 # 調整軸距係數
+        
+        left_speed = v_unity - w_unity * track_factor
+        right_speed = v_unity + w_unity * track_factor
+        
+        # 限制最大速度不超過手動限制
+        max_limit = 15.0
+        left_speed = max(-max_limit, min(max_limit, left_speed))
+        right_speed = max(-max_limit, min(max_limit, right_speed))
+        
+        # 對應順序 [rear_left, rear_right, front_left, front_right]
+        velocities = [left_speed, right_speed, left_speed, right_speed]
+        
+        # 呼叫你在 ros_communicator 寫好的新函式
+        self.car_control_node.publish_raw_car_control(velocities)
 
-            return NavGoal.Result(success=False, message=message)
+
+    # ==========================================
+    # 核心新增 2：P-Controller 與感測器融合循跡
+    # ==========================================
+    def continuous_nav2_tracking(self, targets):
+        """
+        全面依賴 Nav2 的局部規劃器 (Local Planner) 進行防撞導航，
+        並加入 YOLO 橋樑 (Bridge) 視覺排斥力，捨棄無效的 Road 標籤。
+        """
+        result = self.check_prerequisites()
+        if isinstance(result, NavGoal.Result):
+            return result
+
+        car_position, car_orientation, path_points, goal_pose = result
+        car_position, car_orientation, goal_pose = self.data_init(car_position, car_orientation, goal_pose)
+
+        # 1. 判斷是否抵達終點
+        target_distance = cal_distance(car_position, goal_pose)
+        if target_distance < 0.5:
+            self.nav_end_flag = 1
+            self.cmd_vel_to_wheels(0.0, 0.0) # 煞車
+            return NavGoal.Result(success=True, message="Navigation goal reached successfully.")
+
+        # ==========================================
+        # 深度交互 Nav2: 直接採用 Local Planner 的安全指令
+        # ==========================================
+        cmd_vel_msg = self.car_control_node.latest_cmd_vel
+        if cmd_vel_msg is not None:
+            # 這是 Nav2 經過 Costmap 運算後，保證不撞牆的建議前進與轉向速度
+            v_nav = cmd_vel_msg.linear.x
+            w_nav = cmd_vel_msg.angular.z
         else:
-            # All prerequisites are met
-            return car_position, car_orientation, path_points, goal_pose
+            # 若暫時沒收到，保持停止避免暴衝
+            v_nav, w_nav = 0.0, 0.0
 
-    def data_init(self, car_position, car_orientation, goal_pose):
-        return (
-            [car_position.x, car_position.y],
-            [car_orientation.z, car_orientation.w],
-            [goal_pose.x, goal_pose.y],
-        )
-
-    def reset_index(self):
-        self.index = 0
-
-    def parse_yolo_array(self, raw_data):
-        """
-        將 YOLO 傳來的 1D 陣列轉換為分組字典，並按照距離由近到遠排序。
-        格式: [Class_ID_1, Depth_1, DeltaX_1, Class_ID_2, Depth_2, DeltaX_2...]
-        類別對應: 0: bear, 1: bridge, 2: knob
-        """
-        targets = {}
-        if not raw_data or len(raw_data) % 3 != 0:
-            return targets
-
-        for i in range(0, len(raw_data), 3):
-            class_id = int(raw_data[i])
-            depth = float(raw_data[i+1])
-            delta_x = float(raw_data[i+2])
-
-            if depth <= 0.0:
-                continue
-
-            if class_id not in targets:
-                targets[class_id] = []
-                
-            targets[class_id].append({
-                'depth': depth,
-                'delta_x': delta_x
-            })
-
-        # 依據深度進行升序排序，確保 targets[class_id][0] 永遠是最近的目標
-        for cid in targets:
-            targets[cid] = sorted(targets[cid], key=lambda k: k['depth'])
+        # ==========================================
+        # YOLO Bridge 視覺避障 (只在不需要上橋時觸發遠離)
+        # ==========================================
+        w_bridge_avoid = 0.0
+        v_bridge_slowdown = 1.0 # 減速係數
+        
+        # 1 代表 Bridge 的 Class ID
+        if self.current_state != self.STATE_CROSS_BRIDGE and 1 in targets and len(targets[1]) > 0:
+            bridge_data = targets[1][0] 
+            bridge_depth = bridge_data['depth']
+            bridge_offset = bridge_data['delta_x']
             
-        return targets
+            # 如果橋樑進入視野警戒範圍 (例如深度小於 2.5 公尺)
+            if 0.0 < bridge_depth < 2.5:
+                kp_avoid = 0.005  # 【調參點】橋樑排斥力強度
+                
+                # 若橋在畫面右偏 (offset > 0)，為了遠離它，我們要向左轉 (w 為正)
+                # 若橋在畫面左偏 (offset < 0)，我們要向右轉 (w 為負)
+                w_bridge_avoid = -bridge_offset * kp_avoid
+                
+                # 看到橋就稍微減速，給予車子轉向避障的時間
+                v_bridge_slowdown = 0.6 
 
+        # ==========================================
+        # 速度融合與底層輸出
+        # ==========================================
+        # 將基礎速度乘上減速係數
+        v_final = v_nav * v_bridge_slowdown
+        
+        # 將 Nav2 規劃的安全轉向 加上 橋樑的排斥力
+        w_final = w_nav + w_bridge_avoid
+
+        # 發布平滑速度給四輪
+        self.cmd_vel_to_wheels(v_final, w_final)
+        
+        return None
+
+    # ==========================================
+    # 核心新增 3：視覺伺服平滑跟隨
+    # ==========================================
+    def continuous_visual_servo(self, y_offset, object_depth, state_type):
+        """
+        針對熊或橋樑的視覺連續鎖定
+        """
+        kp_yaw = 0.005 # 【調參點】視覺追蹤靈敏度
+        
+        # offset > 0 (目標在右側) -> 車子需向右轉 (負 w)
+        w = -y_offset * kp_yaw 
+        v = 0.0
+
+        # 解耦邏輯：判斷 X 軸偏移量是否夠小
+        # 假設畫面中心容忍誤差為 40 pixels (需依實際相機解析度微調)
+        alignment_tolerance = 40.0 
+
+        if abs(y_offset) > alignment_tolerance:
+            # 狀態 A：還沒對齊，只給角速度 (原地旋轉)
+            # 限制旋轉速度上下限，避免轉太快或轉不動
+            w = max(-1.2, min(1.2, w)) 
+            v = 0.0
+        else:
+            # 狀態 B：已經對齊，給予前進速度，並保留微幅的角速度修正
+            if state_type == self.STATE_CROSS_BRIDGE:
+                v_base = 3.5  # 上橋需要動力
+            else: # STATE_VISUAL_SERVO_BEAR
+                # 距離越近越慢，但不低於 0.4 避免卡死
+                v_base = max(0.4, object_depth * 0.8) 
+            
+            v = v_base
+            w = max(-0.3, min(0.3, w)) # 對齊後限制轉向幅度
+
+        self.cmd_vel_to_wheels(v, w)
+
+
+    # 以下為你的狀態機邏輯 (使用新的連續控制取代舊版)
     def customize_nav(self):
-        """期末專案核心自動控制狀態機 (修復路過撞橋 Bug 版)"""
         raw_coordinate = self.car_control_node.get_latest_yolo_info()
         targets = self.parse_yolo_array(raw_coordinate)
         
         # ==================== 狀態 1：Nav2 大範圍導航狀態 ====================
         if self.current_state == self.STATE_NAV2_TRACKING:
-            
-            # 【修復 1】：刪除 road (ID 3) 輔助，避免與 Nav2 避障路徑衝突
-            
-            # 【修復 2：防止成為「尋橋飛彈」】
-            # 只有當橋樑位於畫面中央附近 (abs(delta_x) < 0.35)，代表 Nav2 的路線真的是直指橋面，才觸發過橋。
-            # 如果橋在畫面邊緣 (abs(delta_x) >= 0.35)，代表只是路過，無視它。
             if 1 in targets and len(targets[1]) > 0:
                 bridge = targets[1][0]
                 if bridge['depth'] < 1.8 and abs(bridge['delta_x']) < 0.35:
@@ -105,7 +169,6 @@ class NavigationController:
                     self.current_state = self.STATE_CROSS_BRIDGE
                     return self.customize_nav()
                 
-            # 【夾取目標熊 (ID 0) 邏輯】：同樣加入 delta_x 限制，避免鎖定到遠處其他任務的熊
             if 0 in targets and len(targets[0]) > 0:
                 bear = targets[0][0]
                 if bear['depth'] < 1.5 and abs(bear['delta_x']) < 0.4:
@@ -114,21 +177,16 @@ class NavigationController:
                     self.nav_end_flag = 0
                     return self.customize_nav()
                 
-            # 沒有觸發視覺接管，老老實實聽 Foxglove 給的 Nav2 路線
-            prereq_result = self.check_prerequisites()
-            if isinstance(prereq_result, NavGoal.Result):
-                self.car_control_node.publish_control("STOP")
-                return None
-            
             self.nav_end_flag = 0
-            return self.manual_nav()
+            # 呼叫新的平滑導航取代 manual_nav
+            return self.continuous_nav2_tracking(targets)
 
         # ==================== 狀態 2：YOLO 視覺伺服精密鎖定熊 ====================
         elif self.current_state == self.STATE_VISUAL_SERVO_BEAR:
             if 0 not in targets or len(targets[0]) == 0:
                 self.car_control_node.get_logger().warn("【狀態警告】目標熊丟失，切回 Nav2。")
                 self.current_state = self.STATE_NAV2_TRACKING
-                self.car_control_node.publish_control("STOP")
+                self.cmd_vel_to_wheels(0.0, 0.0)
                 return None
                 
             closest_bear = targets[0][0]
@@ -139,8 +197,8 @@ class NavigationController:
                 self.current_state = self.STATE_ARRIVED_STOPPING
                 return self.customize_nav()
                 
-            action = self.choose_action_y_offset(y_offset, object_depth)
-            self.car_control_node.publish_control(action)
+            # 呼叫新的平滑視覺伺服
+            self.continuous_visual_servo(y_offset, object_depth, self.current_state)
             return None
 
         # ==================== 狀態 3：視覺強行修正上橋/過橋模式 ====================
@@ -151,148 +209,83 @@ class NavigationController:
                 return self.customize_nav()
 
             if 1 not in targets or len(targets[1]) == 0:
-                self.car_control_node.get_logger().info("【過橋盲區】維持強行 FORWARD 衝刺。")
-                self.car_control_node.publish_control("FORWARD")
+                self.car_control_node.get_logger().info("【過橋盲區】維持強行衝刺。")
+                self.cmd_vel_to_wheels(3.5, 0.0) # 強行直走
                 return None
                 
             closest_bridge = targets[1][0]
             bridge_depth = closest_bridge['depth']
             bridge_offset = closest_bridge['delta_x']
             
-            action = self.choose_action_y_offset(bridge_offset, bridge_depth)
-            if action == "FORWARD_SLOW":
-                action = "FORWARD" # 確保爬坡動力
-            self.car_control_node.publish_control(action)
+            self.continuous_visual_servo(bridge_offset, bridge_depth, self.current_state)
             return None
 
         # ==================== 狀態 4：精準煞車與環境清理狀態 ====================
         elif self.current_state == self.STATE_ARRIVED_STOPPING:
             self.car_control_node.get_logger().info("執行精密煞車中...")
             for _ in range(10):
-                self.car_control_node.publish_control("STOP")
+                self.cmd_vel_to_wheels(0.0, 0.0)
                 time.sleep(0.03)
                 
             self.car_control_node.clear_plan()
             self.car_control_node.clear_goal_pose()
             self.current_state = self.STATE_NAV2_TRACKING
             
-            return NavGoal.Result(
-                success=True,
-                message="導航成功結束！",
-            )
-            
-    def choose_action_y_offset(self, y_offset, object_depth):
-        if object_depth >= 0.5:
-            limit = 0.5
-        elif object_depth <= 0.5:
-            limit = 0.1
-        if y_offset > -limit and y_offset < limit:
-            return "FORWARD_SLOW"
-            self.car_control_node.publish_control("FORWARD_SLOW")
-        elif y_offset >= limit: # 物體在左
-            return "COUNTERCLOCKWISE_ROTATION_SLOW"
-            self.car_control_node.publish_control("COUNTERCLOCKWISE_ROTATION_SLOW")
-        elif y_offset <= -limit:
-            return "CLOCKWISE_ROTATION_SLOW"
-            self.car_control_node.publish_control("CLOCKWISE_ROTATION_SLOW")
+            return NavGoal.Result(success=True, message="導航成功結束！")
 
-    def manual_nav(self):
-        result = self.check_prerequisites()
+    # (保留原有的 check_prerequisites, data_init, parse_yolo_array, get_next_target_point, reset_index)
+    def check_prerequisites(self):
+        car_position, car_orientation = self.car_control_node.get_car_position_and_orientation()
+        path_points = self.car_control_node.get_path_points()
+        goal_pose = self.car_control_node.get_goal_pose()
 
-        if isinstance(result, NavGoal.Result):
-            # 有錯誤就直接回傳結果，不繼續導航流程
-            return result
-
-        # 正常情況才解包
-        car_position, car_orientation, path_points, goal_pose = result
-        car_position, car_orientation, goal_pose = self.data_init(
-            car_position, car_orientation, goal_pose
-        )
-
-        target_distance = cal_distance(car_position, goal_pose)
-        if target_distance < 0.5:
-            self.nav_end_flag = 1
-            self.car_control_node.publish_control("STOP")
-            return NavGoal.Result(
-                success=True,
-                message="Navigation goal reached successfully. Final distance",
-            )
+        if not car_position or not path_points or not goal_pose:
+            message = ("Cannot obtain car position data" if not car_position else 
+                      ("No path points available" if not path_points else "No goal pose"))
+            return NavGoal.Result(success=False, message=message)
         else:
-            target_points, orientation_points = self.get_next_target_point(
-                car_position=car_position, path_points=path_points
-            )
-            diff_angle = calculate_diff_angle(
-                car_position, car_orientation, target_points
-            )
-            action_key = self.choose_action(diff_angle)
-            self.car_control_node.publish_control(action_key)
+            return car_position, car_orientation, path_points, goal_pose
 
-    def choose_action(self, diff_angle):
-        if diff_angle < 20 and diff_angle > -20:
-            action_key = "FORWARD"
-        elif diff_angle < -20 and diff_angle > -180:
-            action_key = "CLOCKWISE_ROTATION"
-        elif diff_angle > 20 and diff_angle < 180:
-            action_key = "COUNTERCLOCKWISE_ROTATION"
-        return action_key
+    def data_init(self, car_position, car_orientation, goal_pose):
+        return ([car_position.x, car_position.y], [car_orientation.z, car_orientation.w], [goal_pose.x, goal_pose.y])
 
-    def get_next_target_point(
-        self, car_position, path_points, min_required_distance=0.5
-    ):
-        """
-        Get the next target point along the path that is at least min_required_distance away
-        from the car_position. Returns a tuple of ([target_x, target_y], [orientation_x, orientation_y])
-        or (None, None) if no valid target is found.
-        """
+    def reset_index(self):
+        self.index = 0
+
+    def parse_yolo_array(self, raw_data):
+        targets = {}
+        if not raw_data or len(raw_data) % 3 != 0:
+            return targets
+        for i in range(0, len(raw_data), 3):
+            class_id, depth, delta_x = int(raw_data[i]), float(raw_data[i+1]), float(raw_data[i+2])
+            if depth <= 0.0: continue
+            if class_id not in targets: targets[class_id] = []
+            targets[class_id].append({'depth': depth, 'delta_x': delta_x})
+        for cid in targets:
+            targets[cid] = sorted(targets[cid], key=lambda k: k['depth'])
+        return targets
+
+    def get_next_target_point(self, car_position, path_points, min_required_distance=0.5):
         logger = self.car_control_node.get_logger()
+        if not path_points: return None, None
+        if not hasattr(self, "index"): self.index = 0
 
-        if not path_points:
-            logger.error("Error: No path points available!")
-            return None, None
-
-        # Ensure self.index is initialized
-        if not hasattr(self, "index"):
-            self.index = 0
-
-        # Iterate over the remaining path points starting from the current index
         for idx in range(self.index, len(path_points)):
             point = path_points[idx]
             try:
-                pos = point["position"]
-                orient = point["orientation"]
+                pos, orient = point["position"], point["orientation"]
                 target_x, target_y = pos[0], pos[1]
                 orientation_x, orientation_y = orient[0], orient[1]
-            except (KeyError, IndexError, TypeError) as e:
-                logger.error(f"Invalid path point format at index {idx}: {e}")
-                continue
+            except Exception: continue
 
             distance_to_target = cal_distance(car_position, (target_x, target_y))
             if distance_to_target >= min_required_distance:
-                # Update self.index to current valid point index for future calls
                 self.index = idx
-                logger.debug(
-                    f"Found valid target point at index {idx} with distance {distance_to_target:.2f}"
-                )
                 return [target_x, target_y], [orientation_x, orientation_y]
-            else:
-                logger.debug(
-                    f"Skipping point at index {idx}: distance {distance_to_target:.2f} is less than required {min_required_distance}"
-                )
 
-        # If no intermediate point meets the criteria, return the final point regardless of distance.
         try:
             last_point = path_points[-1]
-            pos = last_point["position"]
-            orient = last_point["orientation"]
-            last_x, last_y = pos[0], pos[1]
-            last_ox, last_oy = orient[0], orient[1]
-            logger.info(
-                "No point met the minimum distance requirement; using the last point as target."
-            )
+            pos, orient = last_point["position"], last_point["orientation"]
             self.index = len(path_points) - 1
-            return [last_x, last_y], [last_ox, last_oy]
-        except (KeyError, IndexError, TypeError) as e:
-            logger.error(f"Invalid format for last path point: {e}")
-
-        logger.warning("No valid target point found.")
-        return None, None
+            return [pos[0], pos[1]], [orient[0], orient[1]]
+        except Exception: return None, None
