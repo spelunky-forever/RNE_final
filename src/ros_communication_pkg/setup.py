@@ -23,7 +23,6 @@ setup(
         "console_scripts": [
             "ros_car_communication_node = ros_communication_pkg.car_data_collector:main",
             "ros_car_server = ros_communication_pkg.car_service:main",
-            "virtual_wall_node = ros_communication_pkg.virtual_wall_node:main",
         ],
     },
 )

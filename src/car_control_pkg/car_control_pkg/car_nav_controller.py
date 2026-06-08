@@ -1,282 +1,273 @@
+# -*- coding: utf-8 -*-
+from action_interface.action import NavGoal
 from car_control_pkg.nav2_utils import (
     cal_distance,
     calculate_diff_angle,
 )
-from action_interface.action import NavGoal
 import time
+import math
+
+# YOLO 標籤定義
+CLASS_BEAR = 0
+CLASS_BRIDGE = 1
+CLASS_DOOR = 2
 
 class NavigationController:
     def __init__(self, car_control_node):
         self.car_control_node = car_control_node
+        self.index = 0
         self.nav_end_flag = 0 
-        self.STATE_NAV2_TRACKING = "NAV2_TRACKING"       
-        self.STATE_VISUAL_SERVO_BEAR = "VISUAL_SERVO"   
-        self.STATE_CROSS_BRIDGE = "CROSS_BRIDGE"         
-        self.STATE_ARRIVED_STOPPING = "ARRIVED_STOPPING" 
-        self.current_state = self.STATE_NAV2_TRACKING   
+        
+        # --- 狀態機狀態定義 ---
+        self.STATE_EXPLORE_FIND_BEAR = "EXPLORE_FIND_BEAR"   # 主動探索找第一個熊
+        self.STATE_VISUAL_SERVO_BEAR = "VISUAL_SERVO_BEAR"   # 視覺伺服精密鎖定熊
+        self.STATE_AVOID_BRIDGE_WALL = "AVOID_BRIDGE_WALL"   # 緊急避障橋樑側壁
+        self.STATE_ARRIVED_STOPPING = "ARRIVED_STOPPING"     # 精密煞車與原地停等
+        
+        # 初始狀態設定為：主動探索找熊
+        self.current_state = self.STATE_EXPLORE_FIND_BEAR
+        
+        # 任務控制計時器
+        self.action_start_time = None
+        self.avoidance_end_time = 0.0
 
-    # ==========================================
-    # 核心新增 1：差速驅動底層轉換 (Kinematic Model)
-    # ==========================================
     def cmd_vel_to_wheels(self, v, w):
         """
-        將線速度 (v) 與角速度 (w) 轉換為四輪轉速並放大至 Unity 適用區間
+        將線速度 (v) 與角速度 (w) 轉換為左右輪速，並透過 BaseCarControlNode 的
+        publish_control 接口發布。此處完美銜接 your car_control_common.py 的設計。
         """
-        # ==========================================
-        # 【核心修正】物理單位與 Unity 數值縮放
-        # ==========================================
-        v_scale = 18.0  # 【調參點】放大前進速度，讓它接近 manual 的 10.0
-        w_scale = 15.0  # 【調參點】放大轉向速度，讓車子有足夠力矩轉向不撞牆
+        # 根據 Unity 物理特性進行數值縮放與力矩微調
+        v_scale = 15.0  
+        w_scale = 12.0  
         
         v_unity = v * v_scale
         w_unity = w * w_scale
-
-        track_factor = 1.2 # 調整軸距係數
+        track_factor = 1.0 
         
         left_speed = v_unity - w_unity * track_factor
         right_speed = v_unity + w_unity * track_factor
         
-        # 限制最大速度不超過手動限制
-        max_limit = 15.0
+        # 限制極值，防止暴衝或馬達過載
+        max_limit = 12.0
         left_speed = max(-max_limit, min(max_limit, left_speed))
         right_speed = max(-max_limit, min(max_limit, right_speed))
         
-        # 對應順序 [rear_left, rear_right, front_left, front_right]
-        velocities = [left_speed, right_speed, left_speed, right_speed]
-        
-        # 呼叫你在 ros_communicator 寫好的新函式
-        self.car_control_node.publish_raw_car_control(velocities)
+        # 透過 list 形式傳遞，會自動被 car_control_common 解析為四輪轉速
+        self.car_control_node.publish_control([left_speed, right_speed])
 
-
-    # ==========================================
-    # 核心新增 2：P-Controller 與感測器融合循跡
-    # ==========================================
-    def continuous_nav2_tracking(self, targets):
-        """
-        全面依賴 Nav2 的局部規劃器 (Local Planner) 進行防撞導航，
-        並加入 YOLO 橋樑 (Bridge) 視覺排斥力，捨棄無效的 Road 標籤。
-        """
-        result = self.check_prerequisites()
-        if isinstance(result, NavGoal.Result):
-            return result
-
-        car_position, car_orientation, path_points, goal_pose = result
-        car_position, car_orientation, goal_pose = self.data_init(car_position, car_orientation, goal_pose)
-
-        # 1. 判斷是否抵達終點
-        target_distance = cal_distance(car_position, goal_pose)
-        if target_distance < 0.5:
-            self.nav_end_flag = 1
-            self.cmd_vel_to_wheels(0.0, 0.0) # 煞車
-            return NavGoal.Result(success=True, message="Navigation goal reached successfully.")
-
-        # ==========================================
-        # 深度交互 Nav2: 直接採用 Local Planner 的安全指令
-        # ==========================================
-        cmd_vel_msg = self.car_control_node.latest_cmd_vel
-        if cmd_vel_msg is not None:
-            # 這是 Nav2 經過 Costmap 運算後，保證不撞牆的建議前進與轉向速度
-            v_nav = cmd_vel_msg.linear.x
-            w_nav = cmd_vel_msg.angular.z
-        else:
-            # 若暫時沒收到，保持停止避免暴衝
-            v_nav, w_nav = 0.0, 0.0
-
-        # ==========================================
-        # YOLO Bridge 視覺避障 (只在不需要上橋時觸發遠離)
-        # ==========================================
-        w_bridge_avoid = 0.0
-        v_bridge_slowdown = 1.0 # 減速係數
-        
-        # 1 代表 Bridge 的 Class ID
-        if self.current_state != self.STATE_CROSS_BRIDGE and 1 in targets and len(targets[1]) > 0:
-            bridge_data = targets[1][0] 
-            bridge_depth = bridge_data['depth']
-            bridge_offset = bridge_data['delta_x']
-            
-            # 如果橋樑進入視野警戒範圍 (例如深度小於 2.5 公尺)
-            if 0.0 < bridge_depth < 2.5:
-                kp_avoid = 0.005  # 【調參點】橋樑排斥力強度
-                
-                # 若橋在畫面右偏 (offset > 0)，為了遠離它，我們要向左轉 (w 為正)
-                # 若橋在畫面左偏 (offset < 0)，我們要向右轉 (w 為負)
-                w_bridge_avoid = -bridge_offset * kp_avoid
-                
-                # 看到橋就稍微減速，給予車子轉向避障的時間
-                v_bridge_slowdown = 0.6 
-
-        # ==========================================
-        # 速度融合與底層輸出
-        # ==========================================
-        # 將基礎速度乘上減速係數
-        v_final = v_nav * v_bridge_slowdown
-        
-        # 將 Nav2 規劃的安全轉向 加上 橋樑的排斥力
-        w_final = w_nav + w_bridge_avoid
-
-        # 發布平滑速度給四輪
-        self.cmd_vel_to_wheels(v_final, w_final)
-        
-        return None
-
-    # ==========================================
-    # 核心新增 3：視覺伺服平滑跟隨
-    # ==========================================
-    def continuous_visual_servo(self, y_offset, object_depth, state_type):
-        """
-        針對熊或橋樑的視覺連續鎖定
-        """
-        kp_yaw = 0.005 # 【調參點】視覺追蹤靈敏度
-        
-        # offset > 0 (目標在右側) -> 車子需向右轉 (負 w)
-        w = -y_offset * kp_yaw 
-        v = 0.0
-
-        # 解耦邏輯：判斷 X 軸偏移量是否夠小
-        # 假設畫面中心容忍誤差為 40 pixels (需依實際相機解析度微調)
-        alignment_tolerance = 40.0 
-
-        if abs(y_offset) > alignment_tolerance:
-            # 狀態 A：還沒對齊，只給角速度 (原地旋轉)
-            # 限制旋轉速度上下限，避免轉太快或轉不動
-            w = max(-1.2, min(1.2, w)) 
-            v = 0.0
-        else:
-            # 狀態 B：已經對齊，給予前進速度，並保留微幅的角速度修正
-            if state_type == self.STATE_CROSS_BRIDGE:
-                v_base = 3.5  # 上橋需要動力
-            else: # STATE_VISUAL_SERVO_BEAR
-                # 距離越近越慢，但不低於 0.4 避免卡死
-                v_base = max(0.4, object_depth * 0.8) 
-            
-            v = v_base
-            w = max(-0.3, min(0.3, w)) # 對齊後限制轉向幅度
-
-        self.cmd_vel_to_wheels(v, w)
-
-
-    # 以下為你的狀態機邏輯 (使用新的連續控制取代舊版)
     def customize_nav(self):
+        """
+        全自動主控決策迴圈（無省略完整版）
+        """
+        # 1. 取得最新經由物體檢測發布的一維動態陣列
         raw_coordinate = self.car_control_node.get_latest_yolo_info()
         targets = self.parse_yolo_array(raw_coordinate)
         
-        # ==================== 狀態 1：Nav2 大範圍導航狀態 ====================
-        if self.current_state == self.STATE_NAV2_TRACKING:
-            if 1 in targets and len(targets[1]) > 0:
-                bridge = targets[1][0]
-                if bridge['depth'] < 1.8 and abs(bridge['delta_x']) < 0.35:
-                    self.car_control_node.get_logger().info("【狀態切換】Nav2 導航正對橋樑，視覺接管過橋！")
-                    self.current_state = self.STATE_CROSS_BRIDGE
-                    return self.customize_nav()
-                
-            if 0 in targets and len(targets[0]) > 0:
-                bear = targets[0][0]
-                if bear['depth'] < 1.5 and abs(bear['delta_x']) < 0.4:
-                    self.car_control_node.get_logger().info("【狀態切換】正前方發現目標熊！切換至視覺伺服。")
-                    self.current_state = self.STATE_VISUAL_SERVO_BEAR
-                    self.nav_end_flag = 0
-                    return self.customize_nav()
-                
-            self.nav_end_flag = 0
-            # 呼叫新的平滑導航取代 manual_nav
-            return self.continuous_nav2_tracking(targets)
-
-        # ==================== 狀態 2：YOLO 視覺伺服精密鎖定熊 ====================
-        elif self.current_state == self.STATE_VISUAL_SERVO_BEAR:
-            if 0 not in targets or len(targets[0]) == 0:
-                self.car_control_node.get_logger().warn("【狀態警告】目標熊丟失，切回 Nav2。")
-                self.current_state = self.STATE_NAV2_TRACKING
-                self.cmd_vel_to_wheels(0.0, 0.0)
-                return None
-                
-            closest_bear = targets[0][0]
-            object_depth = closest_bear['depth']
-            y_offset = closest_bear['delta_x']
-            
-            if object_depth <= 0.31:
-                self.current_state = self.STATE_ARRIVED_STOPPING
-                return self.customize_nav()
-                
-            # 呼叫新的平滑視覺伺服
-            self.continuous_visual_servo(y_offset, object_depth, self.current_state)
+        # 2. 基本安全前置檢查
+        car_position, car_orientation, path_points, goal_pose = self.check_and_unpack_data()
+        if car_position is None:
+            # 資料尚未補齊時，原地保持安全靜止
+            self.cmd_vel_to_wheels(0.0, 0.0)
             return None
 
-        # ==================== 狀態 3：視覺強行修正上橋/過橋模式 ====================
-        elif self.current_state == self.STATE_CROSS_BRIDGE:
-            if 0 in targets and len(targets[0]) > 0 and targets[0][0]['depth'] < 1.3:
-                self.car_control_node.get_logger().info("【狀態切換】登頂並鎖定橋上的熊！")
+        # =========================================================================
+        # 全局最高優先級：橋樑側壁安全排斥機制（防止撞擊立體三角形非入口區域）
+        # =========================================================================
+        # 只要在探索或跟隨熊的過程中，前方出現橋樑且距離過近，立刻中斷當前行為進行強制避障
+        if self.current_state != self.STATE_AVOID_BRIDGE_WALL:
+            if CLASS_BRIDGE in targets and len(targets[CLASS_BRIDGE]) > 0:
+                closest_bridge = targets[CLASS_BRIDGE][0]
+                # 關鍵防撞閾值：2.3公尺（立著的三角形側面盲區大，需拉長警戒距離）
+                if closest_bridge['depth'] < 2.3:
+                    self.car_control_node.get_logger().warn(
+                        f"🚨 檢測到橋樑側壁危險靠近！距離: {closest_bridge['depth']}m，切換至緊急避障狀態！"
+                    )
+                    self.current_state = self.STATE_AVOID_BRIDGE_WALL
+                    self.avoidance_end_time = time.time() + 1.5 # 強制執行避障動作 1.5 秒
+                    return self.customize_nav()
+
+        # =========================================================================
+        # 狀態機核心決策分支
+        # =========================================================================
+        
+        # 狀態 1：主動探索找附近的第一隻熊
+        if self.current_state == self.STATE_EXPLORE_FIND_BEAR:
+            # 檢查視野中是否捕捉到熊
+            if CLASS_BEAR in targets and len(targets[CLASS_BEAR]) > 0:
+                self.car_control_node.get_logger().info("🐻 YOLO 成功鎖定附近的第一隻熊！轉入視覺伺服追蹤。")
                 self.current_state = self.STATE_VISUAL_SERVO_BEAR
                 return self.customize_nav()
-
-            if 1 not in targets or len(targets[1]) == 0:
-                self.car_control_node.get_logger().info("【過橋盲區】維持強行衝刺。")
-                self.cmd_vel_to_wheels(3.5, 0.0) # 強行直走
-                return None
-                
-            closest_bridge = targets[1][0]
-            bridge_depth = closest_bridge['depth']
-            bridge_offset = closest_bridge['delta_x']
             
-            self.continuous_visual_servo(bridge_offset, bridge_depth, self.current_state)
+            # 主動探索控制邏輯：採用低速原地打轉 + 微幅前進的螺旋式搜索
+            # 解析 latest_cmd_vel (格式為 [v_left, v_right] 的 List)
+            cmd_vel_list = self.car_control_node.latest_cmd_vel
+            if cmd_vel_list is not None and len(cmd_vel_list) == 2:
+                v_left, v_right = cmd_vel_list[0], cmd_vel_list[1]
+                # 從左右輪速反推算 Nav2 建議的線速度(v)與角速度(w)，假設輪距為 0.5
+                wheel_distance = 0.5
+                v_nav = (v_left + v_right) / 2.0
+                w_nav = (v_right - v_left) / wheel_distance
+                
+                w_explore = 0.5 if w_nav == 0.0 else w_nav
+                v_explore = max(0.1, min(0.3, v_nav))
+            else:
+                v_explore = 0.1  # 緩慢微幅前進打破死點
+                w_explore = 0.6  # 原地旋轉掃描
+            
+            self.cmd_vel_to_wheels(v_explore, w_explore)
             return None
 
-        # ==================== 狀態 4：精準煞車與環境清理狀態 ====================
-        elif self.current_state == self.STATE_ARRIVED_STOPPING:
-            self.car_control_node.get_logger().info("執行精密煞車中...")
-            for _ in range(10):
+        # 狀態 2：視覺伺服精密鎖定熊
+        elif self.current_state == self.STATE_VISUAL_SERVO_BEAR:
+            # 確保目標熊依然存在於視野中
+            if CLASS_BEAR not in targets or len(targets[CLASS_BEAR]) == 0:
+                self.car_control_node.get_logger().warn("⚠️ 目標熊從視野丟失，重新回到主動探索狀態。")
+                self.current_state = self.STATE_EXPLORE_FIND_BEAR
                 self.cmd_vel_to_wheels(0.0, 0.0)
-                time.sleep(0.03)
-                
-            self.car_control_node.clear_plan()
-            self.car_control_node.clear_goal_pose()
-            self.current_state = self.STATE_NAV2_TRACKING
+                return None
             
-            return NavGoal.Result(success=True, message="導航成功結束！")
+            closest_bear = targets[CLASS_BEAR][0]
+            bear_depth = closest_bear['depth']
+            bear_offset = closest_bear['delta_x']
+            
+            # 抵達判定條件（Task 1 規定 N units，此處設 0.45m 作為精準抓取觀測點）
+            if bear_depth <= 0.45:
+                self.car_control_node.get_logger().info("🎯 已抵達第一隻熊的觀測範圍，切換至精密煞車與原地停等狀態。")
+                self.current_state = self.STATE_ARRIVED_STOPPING
+                self.action_start_time = time.time()
+                return self.customize_nav()
+            
+            # 視覺伺服 P-Controller 比例控制
+            kp_yaw = 0.0045  # 依像素偏差調整轉向增益
+            w_control = -bear_offset * kp_yaw
+            
+            # 狀態解耦：如果橫向偏差過大（大於45像素），原地轉向對齊，不給前進速度，防止側向偏離撞牆
+            alignment_tolerance = 45.0
+            if abs(bear_offset) > alignment_tolerance:
+                v_control = 0.0
+                w_control = max(-0.8, min(0.8, w_control)) # 限制最大旋轉角速度
+            else:
+                # 已基本對齊，開始穩步接近，距離越近速度越慢（平滑減速機制）
+                v_control = max(0.3, min(0.8, bear_depth * 0.4))
+                w_control = max(-0.2, min(0.2, w_control)) # 對齊後限制轉向擺動幅度
+                
+            self.cmd_vel_to_wheels(v_control, w_control)
+            return None
 
-    # (保留原有的 check_prerequisites, data_init, parse_yolo_array, get_next_target_point, reset_index)
-    def check_prerequisites(self):
+        # 狀態 3：緊急避障橋樑側壁
+        elif self.current_state == self.STATE_AVOID_BRIDGE_WALL:
+            # 強制避障時間檢查
+            if time.time() > self.avoidance_end_time:
+                self.car_control_node.get_logger().info("🔄 離開緊急避障狀態，重新進入找熊主動探索。")
+                self.current_state = self.STATE_EXPLORE_FIND_BEAR
+                return self.customize_nav()
+                
+            # 避障運動規劃：策略是「倒車 + 向橋樑相反側強旋轉」
+            # 檢查當前畫面中橋的相對位置來決定反向切舵方向
+            if CLASS_BRIDGE in targets and len(targets[CLASS_BRIDGE]) > 0:
+                bridge_offset = targets[CLASS_BRIDGE][0]['delta_x']
+                if bridge_offset > 0:
+                    # 橋在右側 -> 倒車並往左猛轉 (正 w)
+                    self.cmd_vel_to_wheels(-0.4, 1.0)
+                else:
+                    # 橋在左側 -> 倒車並往右猛轉 (負 w)
+                    self.cmd_vel_to_wheels(-0.4, -1.0)
+            else:
+                # 若視野中突然失去橋的軌跡，採取安全退後並左轉的盲退策略
+                self.cmd_vel_to_wheels(-0.4, 0.8)
+            return None
+
+        # 狀態 4：精密煞車與環境清理狀態（實現 TASK 1 的 STATIONARY FOR 5+ SECONDS）
+        elif self.current_state == self.STATE_ARRIVED_STOPPING:
+            # 強制介入連續清空發布速度，確保物理底盤在滑行後立刻停死
+            self.cmd_vel_to_wheels(0.0, 0.0)
+            
+            if self.action_start_time is None:
+                self.action_start_time = time.time()
+                
+            elapsed_time = time.time() - self.action_start_time
+            self.car_control_node.get_logger().info(
+                f"⏱️ 原地安全停等中... 目前已停等: {elapsed_time:.1f} 秒 / 目標: 5.0 秒", 
+                throttle_duration_sec=1.0
+            )
+            
+            if elapsed_time >= 5.2:
+                self.car_control_node.get_logger().info("🎉 【TASK 1 成功完成】已成功找到第一隻熊並原地停留超過 5 秒！")
+                
+                # 任務結束，依照系統規範清除全局目標與路徑，避免殘留干擾
+                self.car_control_node.clear_plan()
+                self.car_control_node.clear_goal_pose()
+                self.current_state = self.STATE_EXPLORE_FIND_BEAR # 狀態機重設
+                self.action_start_time = None
+                
+                return NavGoal.Result(success=True, message="Task 1 (Locate & Observe Bear) completed perfectly.")
+            return None
+
+        return None
+
+    # =========================================================================
+    # 基礎底層輔助函數（與架構完全相依，維持不省略）
+    # =========================================================================
+    def check_and_unpack_data(self):
+        """檢查並解包 ROS2 節點訂閱到的關鍵里程計與全局路徑資料"""
         car_position, car_orientation = self.car_control_node.get_car_position_and_orientation()
         path_points = self.car_control_node.get_path_points()
         goal_pose = self.car_control_node.get_goal_pose()
 
-        if not car_position or not path_points or not goal_pose:
-            message = ("Cannot obtain car position data" if not car_position else 
-                      ("No path points available" if not path_points else "No goal pose"))
-            return NavGoal.Result(success=False, message=message)
-        else:
-            return car_position, car_orientation, path_points, goal_pose
-
-    def data_init(self, car_position, car_orientation, goal_pose):
-        return ([car_position.x, car_position.y], [car_orientation.z, car_orientation.w], [goal_pose.x, goal_pose.y])
-
-    def reset_index(self):
-        self.index = 0
+        if not car_position:
+            return None, None, None, None
+            
+        return car_position, car_orientation, path_points, goal_pose
 
     def parse_yolo_array(self, raw_data):
+        """解析 object_detect.py 傳過來的一維 Float32MultiArray 陣列"""
         targets = {}
         if not raw_data or len(raw_data) % 3 != 0:
             return targets
+            
         for i in range(0, len(raw_data), 3):
-            class_id, depth, delta_x = int(raw_data[i]), float(raw_data[i+1]), float(raw_data[i+2])
-            if depth <= 0.0: continue
-            if class_id not in targets: targets[class_id] = []
+            class_id = int(raw_data[i])
+            depth = float(raw_data[i+1])
+            delta_x = float(raw_data[i+2])
+            
+            # 過濾掉無效的深度異常值
+            if depth <= 0.0: 
+                continue
+                
+            if class_id not in targets: 
+                targets[class_id] = []
+                
             targets[class_id].append({'depth': depth, 'delta_x': delta_x})
+            
+        # 針對每一種類別的目標，依照距離由近到遠排序（优先處理最近的危險物/目標）
         for cid in targets:
             targets[cid] = sorted(targets[cid], key=lambda k: k['depth'])
+            
         return targets
 
-    def get_next_target_point(self, car_position, path_points, min_required_distance=0.5):
-        logger = self.car_control_node.get_logger()
-        if not path_points: return None, None
-        if not hasattr(self, "index"): self.index = 0
+    def manual_nav(self):
+        """保留原系統架構之手動巡航接口（防呆預留）"""
+        self.cmd_vel_to_wheels(0.0, 0.0)
+        return NavGoal.Result(success=True, message="Manual Navigation IDLE.")
 
+    def reset_index(self):
+        """重置全域路徑索引值"""
+        self.index = 0
+
+    def get_next_target_point(self, car_position, path_points, min_required_distance=0.5):
+        """全局路徑追蹤點計算函數（保留完整算法）"""
+        if not path_points: 
+            return None, None
+            
         for idx in range(self.index, len(path_points)):
             point = path_points[idx]
             try:
-                pos, orient = point["position"], point["orientation"]
+                pos = point["position"]
+                orient = point["orientation"]
                 target_x, target_y = pos[0], pos[1]
                 orientation_x, orientation_y = orient[0], orient[1]
-            except Exception: continue
+            except (KeyError, IndexError, TypeError): 
+                continue
 
             distance_to_target = cal_distance(car_position, (target_x, target_y))
             if distance_to_target >= min_required_distance:
@@ -285,7 +276,9 @@ class NavigationController:
 
         try:
             last_point = path_points[-1]
-            pos, orient = last_point["position"], last_point["orientation"]
+            pos = last_point["position"]
+            orient = last_point["orientation"]
             self.index = len(path_points) - 1
             return [pos[0], pos[1]], [orient[0], orient[1]]
-        except Exception: return None, None
+        except (KeyError, IndexError, TypeError): 
+            return None, None
