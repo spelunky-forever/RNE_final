@@ -7,62 +7,59 @@ import math
 class VirtualWallNode(Node):
     def __init__(self):
         super().__init__('virtual_wall_node')
-        
-        # 建立發布虛擬牆的 Publisher
         self.wall_pub = self.create_publisher(LaserScan, '/bridge_virtual_scan', 10)
         
-        # 訂閱 YOLO 的辨識結果
+        # 1. 監聽 YOLO：只用來判斷「畫面中有沒有橋」
         self.yolo_sub = self.create_subscription(
             Float32MultiArray, '/yolo/target_info', self.yolo_callback, 10)
+        # 2. 監聽 20 個深度點：用來抓取真實的物理斜坡距離
+        self.depth_sub = self.create_subscription(
+            Float32MultiArray, '/camera/x_multi_depth_values', self.depth_callback, 10)
         
-        self.latest_bridge_depth = float('inf')
+        self.bridge_in_view = False
+        self.multi_depths = []
         
-        # 依據架構書要求：必須以固定頻率(10Hz)持續發布 
         self.timer = self.create_timer(0.1, self.publish_virtual_wall)
-        
-        self.get_logger().info("虛擬牆發布節點 (Virtual Wall Node) 已啟動，頻率 10Hz")
+        self.get_logger().info("【真・物理記憶牆】已啟動！具備永久記憶與防穿透直牆能力。")
 
     def yolo_callback(self, msg):
         raw_data = msg.data
-        min_depth = float('inf')
-        
-        # 解析 yolo_target_info [class_id, depth, delta_x, ...]
+        self.bridge_in_view = False
         if raw_data:
             for i in range(0, len(raw_data), 3):
-                class_id = int(raw_data[i])
-                depth = float(raw_data[i+1])
-                
-                # 如果看到橋樑 (ID: 1)，且有有效深度
-                if class_id == 1 and depth > 0.1:
-                    if depth < min_depth:
-                        min_depth = depth
-                        
-        self.latest_bridge_depth = min_depth
+                if int(raw_data[i]) == 1:  # ID 1 為橋樑
+                    self.bridge_in_view = True
+                    break
+
+    def depth_callback(self, msg):
+        self.multi_depths = msg.data
 
     def publish_virtual_wall(self):
         scan = LaserScan()
         scan.header.stamp = self.get_clock().now().to_msg()
-        # 綁定在車體中心，這樣牆壁會跟著車頭轉動
         scan.header.frame_id = 'base_footprint' 
         
-        # 模擬一個前方 90 度的雷達視角 (-45度 到 +45度)
-        scan.angle_min = -0.785
-        scan.angle_max = 0.785
-        scan.angle_increment = 0.0174 # 約 1 度一個點
+        # 模擬 60 度廣角雷達
+        scan.angle_min = -0.523
+        scan.angle_max = 0.523
+        scan.angle_increment = 1.046 / 20.0  # 對應你的 20 個等分點
         scan.range_min = 0.1
         scan.range_max = 5.0
         
-        num_rays = int((scan.angle_max - scan.angle_min) / scan.angle_increment)
+        ranges = [float('inf')] * 20
         
-        if self.latest_bridge_depth == float('inf'):
-            # 沒看到橋：發布充滿 inf 的陣列，讓 Nav2 清除 Costmap 上的牆壁 
-            scan.ranges = [float('inf')] * num_rays
-        else:
-            # 看到橋：在前方產生一堵距離為 latest_bridge_depth 的牆
-            # 為了確保 Nav2 絕對會繞路，我們把這個 90 度的扇形全部填滿深度
-            # 這樣在 Costmap 上看起來就是正前方有一面無法穿越的巨大弧形牆
-            scan.ranges = [self.latest_bridge_depth] * num_rays
-            
+        if self.bridge_in_view and len(self.multi_depths) == 20:
+            # 過濾無效深度，找出畫面中「最靠近」的物理點（絕對是橋的斜坡，而不是橋底的破洞）
+            valid_depths = [d for d in self.multi_depths if 0.1 < d < 4.0]
+            if valid_depths:
+                min_depth = min(valid_depths)
+                
+                # 幾何拉平演算法：將這 20 個點攤平成一堵與車頭垂直的堅固直牆
+                for i in range(20):
+                    angle = scan.angle_min + i * scan.angle_increment
+                    ranges[i] = min_depth / math.cos(angle)
+                    
+        scan.ranges = ranges
         self.wall_pub.publish(scan)
 
 def main(args=None):
