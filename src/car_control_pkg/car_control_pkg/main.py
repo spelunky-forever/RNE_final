@@ -10,12 +10,12 @@ def main(args=None):
     car_control_node = BaseCarControlNode(
         node_name="car_control_node", enable_nav_subscribers=True
     )
-    #manual_control_node = ManualControlNode()
+    manual_control_node = ManualControlNode()
     action_server = NavigationActionServer(car_control_node=car_control_node)
     executor = MultiThreadedExecutor()
     executor.add_node(car_control_node)
     executor.add_node(action_server)
-    #executor.add_node(manual_control_node)
+    executor.add_node(manual_control_node)
     # Use a multi-threaded executor, no spin_once() calls in the execute_callback
     try:
         executor.spin()
